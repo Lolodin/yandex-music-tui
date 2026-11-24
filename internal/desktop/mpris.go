@@ -155,19 +155,20 @@ func (c *controller) startMPRIS() error {
 	pl := &mprisPlayer{c: c, conn: conn}
 
 	setErr := func(err error) *dbus.Error { return dbus.MakeFailedError(err) }
-	props, err := prop.Export(conn, mprisPath, prop.Map{
+	ro := func(v any) propDef { return propDef{value: v} }
+	props := newProps(conn, mprisPath, map[string]map[string]propDef{
 		ifaceRoot: {
-			"CanQuit":             {Value: true, Emit: prop.EmitConst},
-			"CanRaise":            {Value: false, Emit: prop.EmitConst},
-			"HasTrackList":        {Value: false, Emit: prop.EmitConst},
-			"Identity":            {Value: "Яндекс Музыка (ymusic)", Emit: prop.EmitConst},
-			"SupportedUriSchemes": {Value: []string{}, Emit: prop.EmitConst},
-			"SupportedMimeTypes":  {Value: []string{}, Emit: prop.EmitConst},
+			"CanQuit":             ro(true),
+			"CanRaise":            ro(false),
+			"HasTrackList":        ro(false),
+			"Identity":            ro("Яндекс Музыка (ymusic)"),
+			"SupportedUriSchemes": ro([]string{}),
+			"SupportedMimeTypes":  ro([]string{}),
 		},
 		ifacePlayer: {
-			"PlaybackStatus": {Value: "Stopped", Emit: prop.EmitTrue},
-			"LoopStatus": {Value: "None", Writable: true, Emit: prop.EmitTrue, Callback: func(ch *prop.Change) *dbus.Error {
-				switch ch.Value.(string) {
+			"PlaybackStatus": ro("Stopped"),
+			"LoopStatus": {value: "None", set: func(v dbus.Variant) *dbus.Error {
+				switch v.Value().(string) {
 				case "Track":
 					c.eng.SetRepeat(player.RepeatOne)
 				case "Playlist":
@@ -179,29 +180,28 @@ func (c *controller) startMPRIS() error {
 				}
 				return nil
 			}},
-			"Rate": {Value: 1.0, Writable: true, Emit: prop.EmitTrue, Callback: func(*prop.Change) *dbus.Error { return nil }},
-			"Shuffle": {Value: false, Writable: true, Emit: prop.EmitTrue, Callback: func(ch *prop.Change) *dbus.Error {
-				c.eng.SetShuffle(ch.Value.(bool))
+			"Rate": {value: 1.0, set: func(dbus.Variant) *dbus.Error { return nil }},
+			"Shuffle": {value: false, set: func(v dbus.Variant) *dbus.Error {
+				c.eng.SetShuffle(v.Value().(bool))
 				return nil
 			}},
-			"Metadata": {Value: metadata(player.State{}), Emit: prop.EmitTrue},
-			"Volume": {Value: 1.0, Writable: true, Emit: prop.EmitTrue, Callback: func(ch *prop.Change) *dbus.Error {
-				v := ch.Value.(float64)
-				c.eng.SetVolume(int(math.Round(math.Max(0, math.Min(1, v)) * 100)))
+			"Metadata": ro(metadata(player.State{})),
+			"Volume": {value: 1.0, set: func(v dbus.Variant) *dbus.Error {
+				c.eng.SetVolume(int(math.Round(math.Max(0, math.Min(1, v.Value().(float64))) * 100)))
 				return nil
 			}},
-			"Position":      {Value: int64(0), Emit: prop.EmitFalse},
-			"MinimumRate":   {Value: 1.0, Emit: prop.EmitConst},
-			"MaximumRate":   {Value: 1.0, Emit: prop.EmitConst},
-			"CanGoNext":     {Value: true, Emit: prop.EmitTrue},
-			"CanGoPrevious": {Value: true, Emit: prop.EmitTrue},
-			"CanPlay":       {Value: true, Emit: prop.EmitTrue},
-			"CanPause":      {Value: true, Emit: prop.EmitTrue},
-			"CanSeek":       {Value: false, Emit: prop.EmitTrue},
-			"CanControl":    {Value: true, Emit: prop.EmitConst},
+			"Position":      {value: int64(0), silent: true},
+			"MinimumRate":   ro(1.0),
+			"MaximumRate":   ro(1.0),
+			"CanGoNext":     ro(true),
+			"CanGoPrevious": ro(true),
+			"CanPlay":       ro(true),
+			"CanPause":      ro(true),
+			"CanSeek":       ro(false),
+			"CanControl":    ro(true),
 		},
 	})
-	if err != nil {
+	if err := conn.Export(props, mprisPath, "org.freedesktop.DBus.Properties"); err != nil {
 		conn.Close()
 		return err
 	}
@@ -224,11 +224,11 @@ func (c *controller) startMPRIS() error {
 		Interfaces: []introspect.Interface{
 			introspect.IntrospectData,
 			prop.IntrospectData,
-			{Name: ifaceRoot, Methods: introspect.Methods(root), Properties: props.Introspection(ifaceRoot)},
+			{Name: ifaceRoot, Methods: introspect.Methods(root), Properties: props.introspection(ifaceRoot)},
 			{
 				Name:       ifacePlayer,
 				Methods:    plMethods,
-				Properties: props.Introspection(ifacePlayer),
+				Properties: props.introspection(ifacePlayer),
 				Signals:    []introspect.Signal{{Name: "Seeked", Args: []introspect.Arg{{Name: "Position", Type: "x"}}}},
 			},
 		},
@@ -259,7 +259,7 @@ func (c *controller) startMPRIS() error {
 }
 
 // follow переносит состояние плеера в свойства MPRIS; сигналы шлются только при изменениях.
-func (p *mprisPlayer) follow(props *prop.Properties) {
+func (p *mprisPlayer) follow(props *props) {
 	var (
 		last     player.State
 		first    = true
@@ -271,28 +271,29 @@ func (p *mprisPlayer) follow(props *prop.Properties) {
 		p.st = st
 		p.mu.Unlock()
 
-		set := func(iface, name string, v any) { props.SetMust(iface, name, v) }
+		// Все изменения одного состояния — одним сигналом PropertiesChanged.
+		changes := map[string]any{"Position": int64(st.Pos * 1e6)}
 		if status := playbackStatus(st); first || status != playbackStatus(last) {
-			set(ifacePlayer, "PlaybackStatus", status)
+			changes["PlaybackStatus"] = status
 		}
 		metaKey := fmt.Sprintf("%v|%s|%d", st.HasTrack, st.Track.ID, int(st.Dur))
 		if first || metaKey != lastMeta {
 			lastMeta = metaKey
-			set(ifacePlayer, "Metadata", metadata(st))
+			changes["Metadata"] = metadata(st) // новый словарь каждый раз, старый не меняется
 		}
 		if first || st.Volume != last.Volume {
-			set(ifacePlayer, "Volume", float64(st.Volume)/100)
+			changes["Volume"] = float64(st.Volume) / 100
 		}
 		if first || st.Repeat != last.Repeat {
-			set(ifacePlayer, "LoopStatus", loopStatus(st.Repeat))
+			changes["LoopStatus"] = loopStatus(st.Repeat)
 		}
 		if first || st.Shuffle != last.Shuffle {
-			set(ifacePlayer, "Shuffle", st.Shuffle)
+			changes["Shuffle"] = st.Shuffle
 		}
 		if first || st.HasTrack != last.HasTrack {
-			set(ifacePlayer, "CanSeek", st.HasTrack)
+			changes["CanSeek"] = st.HasTrack
 		}
-		set(ifacePlayer, "Position", int64(st.Pos*1e6))
+		props.update(ifacePlayer, changes)
 
 		// Перемотка (из TUI, трея или по MPRIS) — сигнал Seeked, чтобы виджеты обновили позицию.
 		now := time.Now()

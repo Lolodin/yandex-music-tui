@@ -109,7 +109,14 @@ func TestDesktopDBus(t *testing.T) {
 	call("Next")
 	waitFor("«Второй» после Next", func() bool { return title() == "Второй" })
 	call("Seek", int64(10_000_000))
-	waitFor("позиция ≥ 10 с после Seek", func() bool { p, _ := prop("Position").(int64); return p >= 10_000_000 })
+	atLeast10 := func() bool { p, _ := prop("Position").(int64); return p >= 10_000_000 }
+	waitFor("позиция ≥ 10 с после Seek", atLeast10)
+	// Позиция сразу после команды — целевая; через полсекунды она уже прочитана из mpv,
+	// то есть перемотка действительно выполнена.
+	time.Sleep(600 * time.Millisecond)
+	if !atLeast10() {
+		t.Fatalf("перемотка не выполнена: позиция %v", prop("Position"))
+	}
 	if err := mp.SetProperty("org.mpris.MediaPlayer2.Player.Volume", dbus.MakeVariant(0.3)); err != nil {
 		t.Fatal(err)
 	}

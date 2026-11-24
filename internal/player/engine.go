@@ -103,9 +103,10 @@ type slot struct {
 	reported bool
 	format   stream.SourceFormat
 	hasFmt   bool
-	// seekTo — перемотка, которую mpv не принял, пока файл открывался; выполняется на file-loaded.
+	// seekTo — перемотка, которую mpv не принял, пока файл открывался; tick повторяет её до успеха.
 	seekTo    float64
 	hasSeekTo bool
+	seekTries int
 }
 
 type deck struct {
@@ -538,6 +539,7 @@ func (e *Engine) playPos(p int, startAt float64, userSkip bool) {
 			return
 		}
 		cur.entryID, cur.deck, cur.loaded = id, d.idx, true
+		e.pin()
 		e.onStarted(cur)
 		e.scheduleNext()
 	}()
@@ -585,6 +587,7 @@ func (e *Engine) scheduleNext() {
 		if e.crossfadeMode() {
 			s.startAt = e.introSkip(t)
 			e.next = s
+			e.pin()
 			return
 		}
 		d := e.decks[e.active]
@@ -598,6 +601,7 @@ func (e *Engine) scheduleNext() {
 		}
 		s.entryID, s.deck, s.loaded = id, d.idx, true
 		e.next = s
+		e.pin()
 	}()
 }
 
@@ -779,10 +783,6 @@ func (e *Engine) handle(de deckEvent) {
 	case "end-file":
 		e.onEndFile(d, ev)
 	case "file-loaded":
-		if c := e.cur; c != nil && d.idx == e.active && c.hasSeekTo && ev.EntryID == c.entryID {
-			c.hasSeekTo = false
-			_, _ = d.m.Command("seek", c.seekTo, "absolute")
-		}
 		e.refreshAudio(d)
 	case "audio-reconfig":
 		e.refreshAudio(d)
@@ -905,8 +905,19 @@ func (e *Engine) tick() {
 		return
 	}
 	if d := e.decks[e.active]; d != nil && e.cur != nil && e.cur.loaded {
+		c := e.cur
+		if c.hasSeekTo {
+			// Перемотка, которую mpv не принял, пока файл открывался. Пока она не выполнена,
+			// позиция в интерфейсе — целевая, а не та, с которой файл начал играть.
+			if _, err := d.m.Command("seek", c.seekTo, "absolute"); err == nil {
+				c.hasSeekTo = false
+			} else if c.seekTries++; c.seekTries > 40 {
+				log.Printf("перемотка на %.1f с не удалась: %v", c.seekTo, err)
+				c.hasSeekTo = false
+			}
+		}
 		var pos, dur float64
-		if d.m.Get("time-pos", &pos) == nil {
+		if !c.hasSeekTo && d.m.Get("time-pos", &pos) == nil {
 			e.pos = pos
 			// Ошибки сбрасываются, только когда трек действительно играет, а не просто открылся.
 			if e.failures > 0 && !e.paused && pos >= e.cur.startAt+progressReset {
@@ -927,19 +938,21 @@ func (e *Engine) tick() {
 			e.refreshAudio(d)
 		}
 	}
-	if e.tickN%20 == 0 {
-		// Играющий и следующий источники — самые свежие у прокси: их не вытеснят новые подготовки.
-		var keep []*stream.Source
-		if e.cur != nil {
-			keep = append(keep, e.cur.src)
-		}
-		if e.next != nil {
-			keep = append(keep, e.next.src)
-		}
-		e.srv.Keep(keep...)
-	}
+	e.pin()
 	e.maybeCrossfade()
 	e.emit()
+}
+
+// pin закрепляет у прокси источники играющего и следующего трека: их не вытеснят новые подготовки.
+func (e *Engine) pin() {
+	var keep []*stream.Source
+	if e.cur != nil {
+		keep = append(keep, e.cur.src)
+	}
+	if e.next != nil {
+		keep = append(keep, e.next.src)
+	}
+	e.srv.Keep(keep...)
 }
 
 // --- публикация состояния ---
@@ -1274,11 +1287,7 @@ func (e *Engine) Prev() {
 	defer e.mu.Unlock()
 	defer e.emit()
 	if e.cur != nil && e.pos > 3 {
-		e.stopXfade()
-		if d := e.decks[e.active]; d != nil {
-			_, _ = d.m.Command("seek", 0, "absolute")
-			e.pos = 0
-		}
+		e.seekTo(0)
 		return
 	}
 	if p, ok := e.queue.PrevPos(); ok {
@@ -1320,8 +1329,10 @@ func (e *Engine) seekTo(sec float64) {
 	}
 	e.stopXfade()
 	if _, err := d.m.Command("seek", sec, "absolute"); err != nil {
-		// Файл ещё открывается (например, сразу после «Вперёд»): перемотаем, когда откроется.
-		c.seekTo, c.hasSeekTo = sec, true
+		// Файл ещё открывается (например, сразу после «Вперёд»): tick повторит перемотку.
+		c.seekTo, c.hasSeekTo, c.seekTries = sec, true, 0
+	} else {
+		c.hasSeekTo = false
 	}
 	e.pos = sec
 }

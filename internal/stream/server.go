@@ -28,8 +28,8 @@ import (
 // диапазон берётся с CDN напрямую, не дожидаясь последовательной загрузки.
 const directFetchAhead = 1 << 20
 
-// Сколько последних источников держать зарегистрированными. Источники, которые сейчас раздаются
-// или докачиваются, не вытесняются, даже если их больше.
+// Сколько последних источников держать зарегистрированными. Закреплённые (Keep) и те, что сейчас
+// раздаются mpv, не вытесняются, даже если их больше.
 const maxSources = 8
 
 // Server раздаёт треки mpv по http://127.0.0.1:<port>/s/<token>.<ext>.
@@ -43,6 +43,7 @@ type Server struct {
 	mu      sync.Mutex
 	sources map[string]*Source
 	order   []string
+	pinned  map[*Source]bool
 
 	offline atomic.Bool
 }
@@ -206,14 +207,14 @@ func (s *Server) register(src *Source) *Source {
 	return src
 }
 
-// evict убирает самые старые источники сверх maxSources. Источник, который сейчас раздаётся mpv
-// или ещё докачивается, не трогается: иначе оборвался бы играющий трек. Только что
-// зарегистрированный (последний) не вытесняется никогда.
+// evict убирает самые старые источники сверх maxSources; их незавершённые загрузки отменяются.
+// Закреплённые (играющий и следующий трек) и те, что сейчас раздаются mpv, не трогаются: иначе
+// оборвался бы играющий трек. Только что зарегистрированный (последний) не вытесняется никогда.
 func (s *Server) evict() {
 	for i := 0; len(s.order) > maxSources && i < len(s.order)-1; {
 		tok := s.order[i]
 		old := s.sources[tok]
-		if old != nil && old.busy() {
+		if old != nil && (s.pinned[old] || old.active.Load() > 0) {
 			i++
 			continue
 		}
@@ -246,38 +247,19 @@ func (s *Server) reuse(id api.ID, quality string) *Source {
 	return nil
 }
 
-// Keep отмечает источники как нужные сейчас (играющий и следующий трек), чтобы их не вытеснили
-// новые подготовки, даже когда mpv уже прочитал файл целиком и соединений нет.
+// Keep закрепляет источники, нужные сейчас (играющий и следующий трек), вместо прежних
+// закреплённых: их не вытеснят новые подготовки, даже когда mpv уже прочитал файл целиком
+// и соединений нет. Брошенные источники (пролистанные треки) вытесняются как обычно.
 func (s *Server) Keep(srcs ...*Source) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	pinned := make(map[*Source]bool, len(srcs))
 	for _, src := range srcs {
-		if src == nil {
-			continue
-		}
-		for i, tok := range s.order {
-			if tok == src.Token {
-				s.touch(i)
-				break
-			}
+		if src != nil {
+			pinned[src] = true
 		}
 	}
-}
-
-// busy — источник сейчас раздаётся или его файл ещё докачивается.
-func (src *Source) busy() bool {
-	if src.active.Load() > 0 {
-		return true
-	}
-	src.mu.Lock()
-	d := src.dl
-	src.mu.Unlock()
-	if d == nil {
-		return false
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return !d.done
+	s.mu.Lock()
+	s.pinned = pinned
+	s.mu.Unlock()
 }
 
 // usable — источник можно отдать повторно: файл кэша на месте, загрузка не провалилась.
@@ -584,6 +566,42 @@ func (d *download) waitSize(ctx context.Context) (int64, error) {
 	}
 }
 
+// serveDirect отдаёт диапазон с CDN напрямую, но только пока загрузка не догонит позицию: дальше
+// общий цикл отдаёт из локального файла. mpv читает со скоростью воспроизведения, и без этого
+// соединение с CDN висело бы до конца трека (под паузой CDN может его закрыть).
+func serveDirect(ctx context.Context, w io.Writer, src *Source, d *download, pos *int64, end int64, buf []byte) error {
+	body, _, err := src.openRange(ctx, *pos, end)
+	if err != nil {
+		return err
+	}
+	defer body.Close()
+	for *pos <= end {
+		n, rerr := body.Read(buf[:min(int64(len(buf)), end+1-*pos)])
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			*pos += int64(n)
+		}
+		if rerr == io.EOF {
+			if *pos <= end {
+				return io.ErrUnexpectedEOF
+			}
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+		d.mu.Lock()
+		caught := d.written >= *pos
+		d.mu.Unlock()
+		if caught {
+			return nil
+		}
+	}
+	return nil
+}
+
 func contentType(codec string) string {
 	switch {
 	case codec == "flac":
@@ -740,13 +758,10 @@ func (s *Server) serveBody(ctx context.Context, w io.Writer, src *Source, d *dow
 			return nil
 		}
 		if pos-avail > directFetchAhead {
-			body, _, err := src.openRange(ctx, pos, end)
-			if err != nil {
+			if err := serveDirect(ctx, w, src, d, &pos, end, buf); err != nil {
 				return err
 			}
-			defer body.Close()
-			_, err = io.CopyBuffer(w, body, buf)
-			return err
+			continue
 		}
 		select {
 		case <-ctx.Done():
