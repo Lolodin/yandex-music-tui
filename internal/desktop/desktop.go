@@ -26,19 +26,25 @@ type controller struct {
 	likes  *likes.Store
 	quit   func()
 	online bool
+
+	mprisName string // имя, под которым MPRIS опубликован на шине (пусто — не опубликован)
 }
 
 // Start поднимает трей и MPRIS. Если сессионной шины D-Bus нет (SSH, tty), тихо ничего не делает.
 // Остановки не требуется: при выходе процесса имена на шине освобождаются сами.
 func Start(eng *player.Engine, store *likes.Store, quit func(), opts Options) {
+	start(eng, store, quit, opts)
+}
+
+func start(eng *player.Engine, store *likes.Store, quit func(), opts Options) *controller {
+	c := &controller{eng: eng, likes: store, quit: quit, online: opts.Online}
 	if !opts.Tray && !opts.MPRIS {
-		return
+		return c
 	}
 	if _, err := dbus.SessionBus(); err != nil {
 		log.Printf("D-Bus недоступен, трей и MPRIS отключены: %v", err)
-		return
+		return c
 	}
-	c := &controller{eng: eng, likes: store, quit: quit, online: opts.Online}
 	if opts.MPRIS {
 		if err := c.startMPRIS(); err != nil {
 			log.Printf("MPRIS: %v", err)
@@ -47,6 +53,7 @@ func Start(eng *player.Engine, store *likes.Store, quit func(), opts Options) {
 	if opts.Tray {
 		c.startTray()
 	}
+	return c
 }
 
 // playPause — пауза/продолжение; если очередь пуста, запускает «Мою волну».

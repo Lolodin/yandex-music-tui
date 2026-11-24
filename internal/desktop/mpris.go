@@ -253,6 +253,7 @@ func (c *controller) startMPRIS() error {
 		return err
 	}
 
+	c.mprisName = name
 	go pl.follow(props)
 	return nil
 }

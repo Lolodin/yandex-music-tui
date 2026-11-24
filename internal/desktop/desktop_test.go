@@ -20,6 +20,8 @@ import (
 
 // TestDesktopDBus — сквозная проверка на настоящей сессионной шине: MPRIS-клиент и клики по меню трея
 // (так же, как это делают GNOME Shell и медиаклавиши). Звук — в ao=null.
+// Тест обращается только к своему экземпляру: если параллельно запущен настоящий ymusic, общее имя
+// org.mpris.MediaPlayer2.ymusic занято им, а тестовый получает имя с суффиксом .instance<pid>.
 func TestDesktopDBus(t *testing.T) {
 	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" {
 		t.Skip("нет сессионной шины D-Bus")
@@ -51,7 +53,11 @@ func TestDesktopDBus(t *testing.T) {
 	defer eng.Close()
 
 	quit := make(chan struct{}, 4)
-	Start(eng, likes.New(nil), func() { quit <- struct{}{} }, Options{Tray: true, MPRIS: true, Online: false})
+	c := start(eng, likes.New(nil), func() { quit <- struct{}{} }, Options{Tray: true, MPRIS: true, Online: false})
+	if c.mprisName == "" {
+		t.Fatal("MPRIS не опубликован на шине")
+	}
+	t.Logf("MPRIS тестового экземпляра: %s", c.mprisName)
 	eng.PlayTracks(tracks, 0, "тест")
 
 	conn, err := dbus.ConnectSessionBus()
@@ -59,7 +65,7 @@ func TestDesktopDBus(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	mp := conn.Object("org.mpris.MediaPlayer2.ymusic", "/org/mpris/MediaPlayer2")
+	mp := conn.Object(c.mprisName, "/org/mpris/MediaPlayer2")
 
 	prop := func(name string) any {
 		v, err := mp.GetProperty("org.mpris.MediaPlayer2.Player." + name)

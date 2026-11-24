@@ -9,8 +9,10 @@ import (
 	"io"
 	"log"
 	"math"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ymusic/internal/api"
@@ -51,6 +53,8 @@ type State struct {
 	GainDB   float64
 	HasR128  bool
 	LUFS, TP float64
+	// NoGain — у mpv нет опции volume-gain (mpv < 0.37), нормализация не применяется.
+	NoGain bool
 
 	In, Out AudioParams
 	AO      string
@@ -75,6 +79,18 @@ type State struct {
 	StatusAt  time.Time
 }
 
+const (
+	// maxFailures — после стольких треков подряд, которые не заиграли, воспроизведение останавливается.
+	maxFailures = 5
+	// progressReset — столько секунд нормального воспроизведения сбрасывают счётчик ошибок.
+	progressReset = 3.0
+	// nextDebounce — задержка подготовки следующего трека: серия переключений (настройки, перемешивание)
+	// схлопывается в одну подготовку.
+	nextDebounce = 300 * time.Millisecond
+	// aoInitFailed — file_error mpv, когда не открылся аудиовывод. Пропускать треки бессмысленно.
+	aoInitFailed = "audio output initialization failed"
+)
+
 type slot struct {
 	pos      int
 	track    api.Track
@@ -87,6 +103,9 @@ type slot struct {
 	reported bool
 	format   stream.SourceFormat
 	hasFmt   bool
+	// seekTo — перемотка, которую mpv не принял, пока файл открывался; выполняется на file-loaded.
+	seekTo    float64
+	hasSeekTo bool
 }
 
 type deck struct {
@@ -141,6 +160,11 @@ type Engine struct {
 	failures int
 	tickN    int
 	closed   bool
+	// nextGen — поколение подготовки следующего трека: dropNext и новый scheduleNext отменяют прежние.
+	nextGen uint64
+	noGain  bool
+
+	onPanic atomic.Pointer[func(any)]
 
 	status    string
 	statusErr bool
@@ -226,7 +250,9 @@ func (e *Engine) mpvArgs() []string {
 		"--volume-max=100",
 		"--replaygain=no",
 		"--cache=yes",
-		"--demuxer-max-bytes=64MiB",
+		// Файл и так лежит на диске у локального прокси: большой кэш mpv только раздувает память.
+		"--demuxer-max-bytes=8MiB",
+		"--demuxer-max-back-bytes=4MiB",
 		"--network-timeout=30",
 	}
 	if e.crossfadeMode() {
@@ -284,6 +310,14 @@ func (e *Engine) startDecks() error {
 		d := &deck{idx: i, m: m}
 		e.decks[i] = d
 		go e.forward(d)
+		if i == 0 {
+			// volume-gain появилась в mpv 0.37; на старом mpv нормализация молча не работала бы.
+			var g float64
+			e.noGain = m.Get("volume-gain", &g) != nil
+			if e.noGain {
+				log.Printf("mpv без volume-gain: нормализация недоступна (нужен mpv ≥ 0.37)")
+			}
+		}
 	}
 	e.active = 0
 	e.xf = nil
@@ -327,6 +361,7 @@ func (e *Engine) forward(d *deck) {
 }
 
 func (e *Engine) loop() {
+	defer e.recoverPanic()
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
 	for {
@@ -334,16 +369,38 @@ func (e *Engine) loop() {
 		case <-e.quit:
 			return
 		case de := <-e.events:
-			e.mu.Lock()
-			e.handle(de)
-			e.emit()
-			e.mu.Unlock()
+			e.locked(func() {
+				e.handle(de)
+				e.emit()
+			})
 		case <-t.C:
-			e.mu.Lock()
-			e.tick()
-			e.mu.Unlock()
+			e.locked(e.tick)
 		}
 	}
+}
+
+// locked выполняет f под e.mu; при панике мьютекс отпускается.
+func (e *Engine) locked(f func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	f()
+}
+
+// SetPanicHandler задаёт реакцию на панику в фоновых горутинах движка: интерфейс должен восстановить
+// терминал и завершиться. Без обработчика паника не перехватывается.
+func (e *Engine) SetPanicHandler(h func(any)) { e.onPanic.Store(&h) }
+
+func (e *Engine) recoverPanic() {
+	r := recover()
+	if r == nil {
+		return
+	}
+	log.Printf("паника в плеере: %v\n%s", r, debug.Stack())
+	if h := e.onPanic.Load(); h != nil && *h != nil {
+		(*h)(r)
+		return
+	}
+	panic(r)
 }
 
 // --- статусы ---
@@ -373,7 +430,7 @@ func (e *Engine) Notify(msg string, isErr bool) {
 
 // gainFor — усиление в дБ, чтобы трек звучал на целевой громкости, без превышения −1 dBTP.
 func (e *Engine) gainFor(t api.Track) float64 {
-	if !e.cfg.Normalize || e.cfg.BitPerfect || t.R128 == nil || (t.R128.I == 0 && t.R128.TP == 0) {
+	if !e.cfg.Normalize || e.cfg.BitPerfect || e.noGain || t.R128 == nil || (t.R128.I == 0 && t.R128.TP == 0) {
 		return 0
 	}
 	g := e.cfg.TargetLUFS - t.R128.I
@@ -434,6 +491,7 @@ func (e *Engine) playPos(p int, startAt float64, userSkip bool) {
 	quality := e.quality
 
 	go func() {
+		defer e.recoverPanic()
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		src, err := e.srv.Prepare(ctx, t, quality)
 		cancel()
@@ -445,15 +503,16 @@ func (e *Engine) playPos(p int, startAt float64, userSkip bool) {
 		}
 		e.loading = false
 		if err != nil {
-			e.setErr(fmt.Sprintf("%s: %v", t.FullTitle(), err))
+			msg := fmt.Sprintf("%s: %v", t.FullTitle(), err)
 			e.failures++
-			if e.failures < 5 {
+			if e.failures < maxFailures {
 				if np, ok := e.queue.NextPos(true); ok && np != p {
+					e.setErr(msg)
 					e.playPos(np, 0, false)
 					return
 				}
 			}
-			e.cur = nil
+			e.halt(msg)
 			return
 		}
 		cur.src = src
@@ -471,7 +530,8 @@ func (e *Engine) playPos(p int, startAt float64, userSkip bool) {
 		_ = d.m.Set("volume", e.baseVolume())
 		_ = d.m.Set("pause", false)
 		e.paused = false
-		id, err := d.m.LoadFile(src.URL(), "replace", e.fileOpts(cur, startAt))
+		// cur.startAt, а не startAt: пока трек готовился, могли перемотать (seekTo).
+		id, err := d.m.LoadFile(src.URL(), "replace", e.fileOpts(cur, cur.startAt))
 		if err != nil {
 			e.setErr("mpv loadfile: " + err.Error())
 			e.cur = nil
@@ -497,14 +557,24 @@ func (e *Engine) scheduleNext() {
 		return
 	}
 	t, _ := e.queue.At(p)
-	gen, cur, quality := e.gen, e.cur, e.quality
+	e.nextGen++
+	gen, ngen, cur, quality := e.gen, e.nextGen, e.cur, e.quality
 	go func() {
+		defer e.recoverPanic()
+		time.Sleep(nextDebounce)
+		e.mu.Lock()
+		stale := gen != e.gen || ngen != e.nextGen
+		e.mu.Unlock()
+		if stale {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		src, err := e.srv.Prepare(ctx, t, quality)
 		cancel()
 		e.mu.Lock()
 		defer e.mu.Unlock()
-		if gen != e.gen || e.cur != cur || e.next != nil {
+		// ngen: пока шла подготовка, выбор следующего мог смениться (перемешивание, повтор, настройки).
+		if gen != e.gen || ngen != e.nextGen || e.cur != cur || e.next != nil {
 			return
 		}
 		if err != nil {
@@ -533,6 +603,7 @@ func (e *Engine) scheduleNext() {
 
 // dropNext отменяет подготовленный следующий трек (смена порядка, повтора, настроек).
 func (e *Engine) dropNext() {
+	e.nextGen++
 	n := e.next
 	e.next = nil
 	if n == nil || !n.loaded {
@@ -708,8 +779,9 @@ func (e *Engine) handle(de deckEvent) {
 	case "end-file":
 		e.onEndFile(d, ev)
 	case "file-loaded":
-		if e.cur != nil && d.idx == e.active {
-			e.failures = 0
+		if c := e.cur; c != nil && d.idx == e.active && c.hasSeekTo && ev.EntryID == c.entryID {
+			c.hasSeekTo = false
+			_, _ = d.m.Command("seek", c.seekTo, "absolute")
 		}
 		e.refreshAudio(d)
 	case "audio-reconfig":
@@ -718,11 +790,12 @@ func (e *Engine) handle(de deckEvent) {
 }
 
 func (e *Engine) advanceGapless() {
-	out := e.cur
-	if e.skipping {
-		e.reportEnd(out, false, e.pos)
-	} else {
-		e.reportEnd(out, true, trackDur(out.track))
+	if out := e.cur; out != nil {
+		if e.skipping {
+			e.reportEnd(out, false, e.pos)
+		} else {
+			e.reportEnd(out, true, trackDur(out.track))
+		}
 	}
 	e.skipping = false
 	e.cur, e.next = e.next, nil
@@ -750,18 +823,42 @@ func (e *Engine) onEndFile(d *deck, ev mpv.Event) {
 		e.reportEnd(e.cur, true, trackDur(e.cur.track))
 		e.advanceAfterEnd()
 	case "error":
-		e.failures++
 		msg := ev.FileErr
 		if msg == "" {
 			msg = "ошибка"
 		}
-		e.setErr(fmt.Sprintf("%s: не воспроизводится (%s)", e.cur.track.FullTitle(), msg))
-		if e.failures < 5 {
+		if msg == aoInitFailed {
+			// Дело не в треке, а в устройстве: перебирать очередь бессмысленно.
+			e.halt("Не открылся аудиовывод — проверьте устройство на вкладке «Настройки» (" + msg + ")")
+			return
+		}
+		e.failures++
+		msg = fmt.Sprintf("%s: не воспроизводится (%s)", e.cur.track.FullTitle(), msg)
+		if e.failures < maxFailures {
+			e.setErr(msg)
 			e.advanceAfterEnd()
 		} else {
-			e.cur = nil
+			e.halt(msg)
 		}
 	}
+}
+
+// halt останавливает воспроизведение после ошибок: следующий трек убирается из плейлиста mpv,
+// иначе mpv сам перейдёт к нему. Продолжить можно кнопкой «Играть» или выбором трека.
+func (e *Engine) halt(msg string) {
+	e.stopXfade()
+	e.dropNext()
+	for _, d := range e.decks {
+		if d != nil {
+			_, _ = d.m.Command("stop")
+		}
+	}
+	e.cur = nil
+	e.loading = false
+	if e.failures >= maxFailures {
+		msg = fmt.Sprintf("Остановлено: %d треков подряд не заиграли. %s", e.failures, msg)
+	}
+	e.setErr(msg)
 }
 
 func (e *Engine) advanceAfterEnd() {
@@ -811,6 +908,10 @@ func (e *Engine) tick() {
 		var pos, dur float64
 		if d.m.Get("time-pos", &pos) == nil {
 			e.pos = pos
+			// Ошибки сбрасываются, только когда трек действительно играет, а не просто открылся.
+			if e.failures > 0 && !e.paused && pos >= e.cur.startAt+progressReset {
+				e.failures = 0
+			}
 		}
 		if d.m.Get("duration", &dur) == nil && dur > 0 {
 			e.dur = dur
@@ -825,6 +926,17 @@ func (e *Engine) tick() {
 		if e.in.SampleRate == 0 {
 			e.refreshAudio(d)
 		}
+	}
+	if e.tickN%20 == 0 {
+		// Играющий и следующий источники — самые свежие у прокси: их не вытеснят новые подготовки.
+		var keep []*stream.Source
+		if e.cur != nil {
+			keep = append(keep, e.cur.src)
+		}
+		if e.next != nil {
+			keep = append(keep, e.next.src)
+		}
+		e.srv.Keep(keep...)
 	}
 	e.maybeCrossfade()
 	e.emit()
@@ -859,6 +971,11 @@ func (e *Engine) pathClean() bool {
 	if e.ao != "alsa" {
 		return false
 	}
+	// ALSA default/plughw/sysdefault — это плагины (на десктопе обычно PipeWire/PulseAudio с микшером
+	// и ресемплингом), которых mpv не видит. Чистый путь — только прямое устройство hw:.
+	if !strings.HasPrefix(e.dev, "alsa/hw:") {
+		return false
+	}
 	if e.in.SampleRate != e.out.SampleRate || e.in.ChannelCount != e.out.ChannelCount {
 		return false
 	}
@@ -890,6 +1007,7 @@ func (e *Engine) emit() {
 		Transition:  e.cfg.Transition,
 		Crossfading: e.xf != nil,
 		Normalize:   e.cfg.Normalize && !e.cfg.BitPerfect,
+		NoGain:      e.noGain,
 		Shuffle:     e.queue.shuffle,
 		Repeat:      e.queue.repeat,
 		Source:      e.queue.source,
@@ -969,6 +1087,7 @@ func (e *Engine) PlayWave(seeds []string, title string) {
 	e.emit()
 	e.mu.Unlock()
 	go func() {
+		defer e.recoverPanic()
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		s, err := e.api.RotorSessionNew(ctx, seeds, nil)
 		cancel()
@@ -1015,6 +1134,7 @@ func (e *Engine) fetchWave() {
 		}
 	}
 	go func() {
+		defer e.recoverPanic()
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		s, err := e.api.RotorSessionTracks(ctx, w.sessionID, q)
 		cancel()
@@ -1184,15 +1304,26 @@ func (e *Engine) SeekTo(sec float64) {
 }
 
 func (e *Engine) seekTo(sec float64) {
+	c := e.cur
+	if c == nil {
+		return
+	}
+	sec = math.Max(0, sec)
+	if !c.loaded {
+		// Трек ещё готовится (например, сразу после «Вперёд»): он начнётся с нужного места.
+		c.startAt, e.pos = sec, sec
+		return
+	}
 	d := e.decks[e.active]
-	if d == nil || e.cur == nil || !e.cur.loaded {
+	if d == nil {
 		return
 	}
 	e.stopXfade()
-	sec = math.Max(0, sec)
-	if _, err := d.m.Command("seek", sec, "absolute"); err == nil {
-		e.pos = sec
+	if _, err := d.m.Command("seek", sec, "absolute"); err != nil {
+		// Файл ещё открывается (например, сразу после «Вперёд»): перемотаем, когда откроется.
+		c.seekTo, c.hasSeekTo = sec, true
 	}
+	e.pos = sec
 }
 
 func (e *Engine) ChangeVolume(delta int) {
@@ -1306,6 +1437,8 @@ func (e *Engine) ApplyConfig(cfg config.Audio) error {
 	defer e.mu.Unlock()
 	defer e.emit()
 	old := e.cfg
+	// Громкостью владеет движок (клавиши +/-, MPRIS); в cfg из интерфейса она может быть устаревшей.
+	cfg.Volume = old.Volume
 	e.cfg = cfg
 	if old.MpvPath != cfg.MpvPath {
 		aos, err := mpv.AudioOutputs(cfg.MpvPath)
@@ -1334,7 +1467,7 @@ func (e *Engine) ApplyConfig(cfg config.Audio) error {
 	}
 	if c := e.cur; c != nil {
 		c.gain = e.gainFor(c.track)
-		if d := e.decks[e.active]; d != nil && c.loaded {
+		if d := e.decks[e.active]; d != nil && c.loaded && !e.noGain {
 			_ = d.m.Set("volume-gain", c.gain)
 		}
 	}

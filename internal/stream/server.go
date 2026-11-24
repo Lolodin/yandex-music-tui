@@ -28,7 +28,8 @@ import (
 // диапазон берётся с CDN напрямую, не дожидаясь последовательной загрузки.
 const directFetchAhead = 1 << 20
 
-// Сколько последних источников держать зарегистрированными.
+// Сколько последних источников держать зарегистрированными. Источники, которые сейчас раздаются
+// или докачиваются, не вытесняются, даже если их больше.
 const maxSources = 8
 
 // Server раздаёт треки mpv по http://127.0.0.1:<port>/s/<token>.<ext>.
@@ -87,6 +88,8 @@ type Source struct {
 	info   *api.DownloadInfo
 	infoAt time.Time
 	dl     *download
+
+	active atomic.Int32 // открытые HTTP-ответы mpv
 }
 
 func (src *Source) URL() string {
@@ -131,14 +134,25 @@ func newToken() string {
 	return hex.EncodeToString(b)
 }
 
-// Prepare выбирает источник: кэш нужного качества → get-file-info → любой файл из кэша (без сети).
+// Prepare выбирает источник: уже подготовленный для этого трека → кэш нужного качества →
+// get-file-info → любой файл из кэша (без сети).
 func (s *Server) Prepare(ctx context.Context, t api.Track, quality string) (*Source, error) {
+	// Тот же трек уже подготовлен (например, «следующий» после смены настроек или порядка) —
+	// отдаём его же: без нового get-file-info и без второй загрузки.
+	if src := s.reuse(t.ID, quality); src != nil {
+		return src, nil
+	}
+	cached := func(e Entry) *Source {
+		src := s.cachedSource(t, e)
+		src.requested = quality
+		return s.register(src)
+	}
 	if e, ok := s.cache.Lookup(t.ID, quality); ok {
-		return s.register(s.cachedSource(t, e)), nil
+		return cached(e), nil
 	}
 	if s.Offline() {
 		if e, ok := s.cache.Lookup(t.ID, ""); ok {
-			return s.register(s.cachedSource(t, e)), nil
+			return cached(e), nil
 		}
 		return nil, errors.New("офлайн: трека нет в кэше")
 	}
@@ -146,13 +160,13 @@ func (s *Server) Prepare(ctx context.Context, t api.Track, quality string) (*Sou
 	if err != nil {
 		if e, ok := s.cache.Lookup(t.ID, ""); ok {
 			log.Printf("file-info %s: %v — играю из кэша", t.ID, err)
-			return s.register(s.cachedSource(t, e)), nil
+			return cached(e), nil
 		}
 		return nil, err
 	}
 	// Запросили lossless, а у трека есть только hq, который уже лежит в кэше.
 	if e, ok := s.cache.Exact(t.ID, info.Quality); ok && e.Codec == info.Codec {
-		return s.register(s.cachedSource(t, e)), nil
+		return cached(e), nil
 	}
 	src := &Source{
 		Track:     t,
@@ -188,15 +202,99 @@ func (s *Server) register(src *Source) *Source {
 	defer s.mu.Unlock()
 	s.sources[src.Token] = src
 	s.order = append(s.order, src.Token)
-	for len(s.order) > maxSources {
-		old := s.sources[s.order[0]]
-		delete(s.sources, s.order[0])
-		s.order = s.order[1:]
+	s.evict()
+	return src
+}
+
+// evict убирает самые старые источники сверх maxSources. Источник, который сейчас раздаётся mpv
+// или ещё докачивается, не трогается: иначе оборвался бы играющий трек. Только что
+// зарегистрированный (последний) не вытесняется никогда.
+func (s *Server) evict() {
+	for i := 0; len(s.order) > maxSources && i < len(s.order)-1; {
+		tok := s.order[i]
+		old := s.sources[tok]
+		if old != nil && old.busy() {
+			i++
+			continue
+		}
+		delete(s.sources, tok)
+		s.order = append(s.order[:i], s.order[i+1:]...)
 		if old != nil {
 			old.release()
 		}
 	}
-	return src
+}
+
+// touch переносит источник в конец очереди вытеснения (самый свежий).
+func (s *Server) touch(i int) {
+	tok := s.order[i]
+	s.order = append(append(s.order[:i], s.order[i+1:]...), tok)
+}
+
+// reuse — уже зарегистрированный рабочий источник этого трека в том же запрошенном качестве.
+func (s *Server) reuse(id api.ID, quality string) *Source {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.order) - 1; i >= 0; i-- {
+		src := s.sources[s.order[i]]
+		if src == nil || src.Track.ID != id || src.requested != quality || !src.usable() {
+			continue
+		}
+		s.touch(i)
+		return src
+	}
+	return nil
+}
+
+// Keep отмечает источники как нужные сейчас (играющий и следующий трек), чтобы их не вытеснили
+// новые подготовки, даже когда mpv уже прочитал файл целиком и соединений нет.
+func (s *Server) Keep(srcs ...*Source) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, src := range srcs {
+		if src == nil {
+			continue
+		}
+		for i, tok := range s.order {
+			if tok == src.Token {
+				s.touch(i)
+				break
+			}
+		}
+	}
+}
+
+// busy — источник сейчас раздаётся или его файл ещё докачивается.
+func (src *Source) busy() bool {
+	if src.active.Load() > 0 {
+		return true
+	}
+	src.mu.Lock()
+	d := src.dl
+	src.mu.Unlock()
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return !d.done
+}
+
+// usable — источник можно отдать повторно: файл кэша на месте, загрузка не провалилась.
+func (src *Source) usable() bool {
+	if src.FromCache {
+		_, err := os.Stat(src.cachePath)
+		return err == nil
+	}
+	src.mu.Lock()
+	d := src.dl
+	src.mu.Unlock()
+	if d == nil {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.err == nil
 }
 
 func (src *Source) release() {
@@ -550,6 +648,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	src.active.Add(1)
+	defer src.active.Add(-1)
 	if src.FromCache {
 		s.cache.Touch(src.cachePath)
 		w.Header().Set("Content-Type", contentType(src.Codec))

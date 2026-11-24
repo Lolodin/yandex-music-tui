@@ -349,9 +349,12 @@ func (m *Model) signalLine(st player.State) string {
 	parts = append(parts, src)
 
 	if st.Normalize {
-		if st.HasR128 {
+		switch {
+		case st.NoGain:
+			parts = append(parts, sErr.Render("нормализация недоступна: нужен mpv ≥ 0.37"))
+		case st.HasR128:
 			parts = append(parts, fmt.Sprintf("R128 %.1f LUFS → %+.1f dB", st.LUFS, st.GainDB))
-		} else {
+		default:
 			parts = append(parts, sDim.Render("R128 нет данных"))
 		}
 	}
@@ -370,6 +373,8 @@ func (m *Model) signalLine(st player.State) string {
 			parts = append(parts, sDim.Render("bit-perfect…"))
 		case st.AO != "alsa":
 			parts = append(parts, sErr.Render("не bit-perfect: вывод через "+st.AO))
+		case !strings.HasPrefix(st.Device, "alsa/hw:"):
+			parts = append(parts, sErr.Render("не bit-perfect: выберите устройство alsa/hw:… (через ALSA default звук идёт в микшер)"))
 		case st.In.SampleRate != st.Out.SampleRate:
 			parts = append(parts, sErr.Render("не bit-perfect: ресемплинг"))
 		default:

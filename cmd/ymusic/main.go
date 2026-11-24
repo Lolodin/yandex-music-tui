@@ -12,10 +12,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/muesli/cancelreader"
 
 	"ymusic/internal/api"
 	"ymusic/internal/config"
@@ -148,10 +149,23 @@ func run(cfgPath string, relogin bool, token string, offline bool) error {
 		p.Quit()
 	}()
 
+	// Паника в фоновой горутине плеера не должна оставлять терминал в alt-screen и raw-режиме:
+	// останавливаем TUI штатно (Kill восстанавливает терминал) и выходим с ошибкой.
+	var crash atomic.Value
+	eng.SetPanicHandler(func(r any) {
+		crash.Store(fmt.Sprint(r))
+		p.Kill()
+	})
+
 	_, err = p.Run()
 	model.SaveConfig()
+	if r := crash.Load(); r != nil {
+		return fmt.Errorf("внутренняя ошибка плеера: %v (подробности в %s)", r, filepath.Join(cfg.Cache.Dir, "ymusic.log"))
+	}
 	return err
 }
+
+var errInputClosed = errors.New("ввод закрыт")
 
 // login — вход по коду с другого устройства или вставкой токена.
 func login() (string, error) {
@@ -185,22 +199,46 @@ func login() (string, error) {
 	}
 	fmt.Print("> ")
 
+	// Чтение stdin должно закончиться вместе с login(): иначе забытая горутина продолжит читать терминал
+	// параллельно с TUI и будет забирать нажатия клавиш. Поэтому ридер отменяемый.
+	var in io.Reader = os.Stdin
+	cr, err := cancelreader.NewReader(os.Stdin)
+	if err == nil {
+		in = cr
+	}
+	done := make(chan struct{})
+	readerDone := make(chan struct{})
 	go func() {
-		sc := bufio.NewScanner(os.Stdin)
+		defer close(readerDone)
+		send := func(r result) {
+			select {
+			case results <- r:
+			case <-done:
+			}
+		}
+		sc := bufio.NewScanner(in)
 		for sc.Scan() {
 			if t := api.ExtractToken(sc.Text()); t != "" {
-				results <- result{token: t}
+				send(result{token: t})
 				return
 			}
 			fmt.Print("> ")
 		}
-		results <- result{err: errors.New("ввод закрыт")}
+		send(result{err: errInputClosed})
+	}()
+	defer func() {
+		close(done)
+		if cr != nil {
+			cr.Cancel()
+			<-readerDone
+			_ = cr.Close()
+		}
 	}()
 
 	for {
 		r := <-results
 		if r.err != nil {
-			if dc != nil && !strings.Contains(r.err.Error(), "ввод закрыт") {
+			if dc != nil && !errors.Is(r.err, errInputClosed) {
 				fmt.Println("\nВход по коду не удался:", r.err)
 				fmt.Print("Вставьте токен вручную > ")
 				dc = nil
